@@ -1,0 +1,51 @@
+name: PHP 8.2 Shim
+slug: php-82-shim
+type: plugin
+version: 1.0.0
+description: Runs Grav 2 on PHP 8.2 hosts by transpiling installed packages and relaxing version gates. Unofficial compatibility layer — use at your own risk.
+icon: plug
+author:
+  name: Artyom Mezin
+  email: artyom@mezin.me
+homepage: https://github.com/Sogl/grav-plugin-php-82-shim
+keywords: grav, plugin, php82, php83, compatibility, shared hosting
+bugs: https://github.com/Sogl/grav-plugin-php-82-shim/issues
+docs: https://github.com/Sogl/grav-plugin-php-82-shim/blob/main/README.md
+license: MIT
+compatibility:
+  grav:
+    - '2.0'
+
+dependencies:
+  - { name: grav, version: '>=2.0.0' }
+  - { name: php, version: '>=8.2 <8.4' }
+
+form:
+  validation: loose
+  fields:
+    log_info:
+      type: display
+      label: PLUGIN_PHP82SHIM.LOG_INFO_LABEL
+      markdown: true
+      content: PLUGIN_PHP82SHIM.LOG_INFO_CONTENT
+    block_unshimmable:
+      type: toggle
+      label: PLUGIN_PHP82SHIM.BLOCK_LABEL
+      help: PLUGIN_PHP82SHIM.BLOCK_HELP
+      highlight: 1
+      default: 1
+      options:
+        1: PLUGIN_ADMIN.ENABLED
+        0: PLUGIN_ADMIN.DISABLED
+      validate:
+        type: bool
+    enabled:
+      type: toggle
+      label: PLUGIN_ADMIN.PLUGIN_STATUS
+      highlight: 1
+      default: 1
+      options:
+        1: PLUGIN_ADMIN.ENABLED
+        0: PLUGIN_ADMIN.DISABLED
+      validate:
+        type: bool

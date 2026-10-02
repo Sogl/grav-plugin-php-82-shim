@@ -1,0 +1,28 @@
+version: 1
+prefix: php82shim
+tools:
+  - name: log
+    title: Read shim activity log
+    description: >
+      Returns the PHP 8.2 shim activity log (newest first, up to 300 entries):
+      what packages were transpiled, which core patches were applied or failed,
+      and any unshimmable PHP 8.3 constructs that will fatal if reached on 8.2.
+      Also reports patch-anchor failures, the early-prepend heartbeat age, and
+      the real PHP version. Use it to check shim health after core/plugin
+      updates.
+    method: GET
+    path: /php82shim/log
+    permission: admin.super
+    annotations:
+      readOnly: true
+
+  - name: clear_log
+    title: Clear shim activity log
+    description: >
+      Truncates the shim's JSONL activity log. Use after reviewing entries —
+      the log itself is not required for the shim to keep working.
+    method: POST
+    path: /php82shim/clear
+    permission: admin.super
+    annotations:
+      destructive: true
