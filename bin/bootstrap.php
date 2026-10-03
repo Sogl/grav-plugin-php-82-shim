@@ -21,11 +21,15 @@ foreach (['ShimLog', 'Lock', 'Transpiler', 'PatchManager'] as $cls) {
 use Grav\Plugin\Php82Shim\PatchManager;
 use Grav\Plugin\Php82Shim\Transpiler;
 
-if (PHP_VERSION_ID >= 80200 && PHP_VERSION_ID < 80300) {
-    echo "runtime: PHP " . PHP_VERSION . " — token validation is target-authoritative\n";
-} else {
-    echo "WARNING: running under PHP " . PHP_VERSION . " — 8.2 parse validation is NOT authoritative on this engine\n";
+// Hard gate: the shim exists for real PHP 8.2 hosts only. On 8.3+ it would
+// patch a native runtime, downgrade plugin syntax for no reason and make
+// the site report a fake PHP version to GPM — refuse, patch nothing.
+if (PHP_VERSION_ID < 80200 || PHP_VERSION_ID >= 80300) {
+    fwrite(STDERR, "php82shim: refusing to run — this is PHP " . PHP_VERSION
+        . ", the shim only patches real PHP 8.2 hosts\n");
+    exit(1);
 }
+echo "runtime: PHP " . PHP_VERSION . " — token validation is target-authoritative\n";
 
 $fail = 0;
 

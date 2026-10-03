@@ -230,9 +230,12 @@ class Transpiler
 
         // Context stack: 'class' when inside class-like body, 'fn' inside
         // function/method body, 'block' otherwise. Only `const` directly in
-        // 'class' context is a class constant candidate.
+        // 'class' context is a class constant candidate. Pendings are
+        // recorded WITH their paren depth — `new class(fn() => 1) {` pushes
+        // 'class' for the outer body, not the args-time 'fn'.
         $stack = [];
-        $pending = null; // context to push on next '{'
+        $pendStack = []; // list<array{0:string,1:int}> ctx + paren depth
+        $depth = 0;
 
         $prevMeaningful = static function (int $j) use ($tokens): array|string {
             for ($k = $j - 1; $k >= 0; $k--) {
@@ -250,12 +253,24 @@ class Transpiler
 
             if (!is_array($t)) {
                 if ($t === '{') {
-                    $stack[] = $pending ?? 'block';
-                    $pending = null;
+                    while ($pendStack !== [] && end($pendStack)[1] > $depth) {
+                        array_pop($pendStack);
+                    }
+                    $stack[] = $pendStack !== [] ? array_pop($pendStack)[0] : 'block';
                 } elseif ($t === '}') {
                     array_pop($stack);
                 } elseif ($t === ';') {
-                    $pending = null;
+                    // `;` inside `new class(function () {...})` args must not
+                    // discard the outer 'class' pending — drop only pendings
+                    // recorded at this depth or deeper.
+                    $pendStack = array_values(array_filter(
+                        $pendStack,
+                        static fn($p) => $p[1] < $depth
+                    ));
+                } elseif ($t === '(' || $t === '[') {
+                    $depth++;
+                } elseif ($t === ')' || $t === ']') {
+                    $depth = max(0, $depth - 1);
                 }
                 $out .= $t;
                 $i++;
@@ -265,13 +280,34 @@ class Transpiler
             $id = $t[0];
             $text = $t[1];
 
+            // String interpolation — `"{$x}"`, `"${x}"`, heredoc `{$x}`.
+            // The closing '}' is a plain char token: it must pop THIS entry,
+            // not the enclosing class body.
+            if ($id === T_CURLY_OPEN
+                || (defined('T_DOLLAR_OPEN_CURLY_BRACES') && $id === T_DOLLAR_OPEN_CURLY_BRACES)) {
+                $stack[] = 'strinterp';
+                $out .= $text;
+                $i++;
+                continue;
+            }
+
+            // `#[` is an array token but its closing `]` arrives as a plain
+            // char — count it as an open bracket or the `]` would corrupt
+            // the paren depth inside `new class(#[A] function…)` args.
+            if (defined('T_ATTRIBUTE') && $id === T_ATTRIBUTE) {
+                $depth++;
+                $out .= $text;
+                $i++;
+                continue;
+            }
+
             // --- context tracking -------------------------------------------
             if (in_array($id, [T_CLASS, T_INTERFACE, T_TRAIT], true) || (defined('T_ENUM') && $id === T_ENUM)) {
                 $prev = $prevMeaningful($i);
                 // `Foo::class` / `?->` are not declarations; `new class` IS one.
                 if (!(is_array($prev) && $prev[0] === T_DOUBLE_COLON)
                     && !(is_array($prev) && $prev[0] === T_OBJECT_OPERATOR)) {
-                    $pending = 'class';
+                    $pendStack[] = ['class', $depth];
                 }
                 $out .= $text;
                 $i++;
@@ -279,30 +315,58 @@ class Transpiler
             }
 
             if (in_array($id, [T_FUNCTION, T_FN], true)) {
-                $pending = 'fn';
+                $pendStack[] = ['fn', $depth];
                 $out .= $text;
                 $i++;
                 continue;
             }
 
-            // `new readonly class` — named readonly classes are legal on 8.2,
-            // only the anonymous form is 8.3. Strip readonly after `new`.
-            if ($id === T_READONLY && defined('T_READONLY')) {
-                $prev = $prevMeaningful($i);
-                if (is_array($prev) && $prev[0] === T_NEW) {
-                    $j = $i + 1;
-                    $ws = '';
-                    // whitespace AND comments may sit between `readonly`/`class`
-                    while ($j < $count && is_array($tokens[$j])
-                        && in_array($tokens[$j][0], [T_WHITESPACE, T_COMMENT, T_DOC_COMMENT], true)) {
-                        $ws .= $tokens[$j][1];
-                        $j++;
-                    }
-                    if ($j < $count && is_array($tokens[$j]) && $tokens[$j][0] === T_CLASS) {
-                        self::$log[] = "$path: readonly anonymous class demoted";
-                        $i = $j; // skip `readonly` + whitespace, keep `class`
+            // `new readonly class` / `new #[Attr] readonly class` — named
+            // readonly classes are legal on 8.2, only the anonymous form is
+            // 8.3. Scan forward from `new`: attribute groups + readonly in
+            // any order may precede `class`.
+            if ($id === T_NEW) {
+                $j = self::nextMeaningful($tokens, $i + 1);
+                $roIdx = null;
+                while ($j !== null) {
+                    $tj = $tokens[$j];
+                    if (is_array($tj) && defined('T_ATTRIBUTE') && $tj[0] === T_ATTRIBUTE) {
+                        $j = self::matchForward($tokens, $j + 1, '[', ']');
+                        $j = $j === null ? null : self::nextMeaningful($tokens, $j + 1);
                         continue;
                     }
+                    if (is_array($tj) && defined('T_READONLY') && $tj[0] === T_READONLY && $roIdx === null) {
+                        $roIdx = $j;
+                        $j = self::nextMeaningful($tokens, $j + 1);
+                        continue;
+                    }
+                    if (!(is_array($tj) && $tj[0] === T_CLASS)) {
+                        $j = null;
+                    }
+                    break;
+                }
+                if ($j !== null && $roIdx !== null) {
+                    self::$log[] = "$path: readonly anonymous class demoted";
+                    $out .= $text; // `new`
+                    // Re-emit everything up to `class` EXCEPT the readonly
+                    // token — attributes may sit on either side of it. The
+                    // whitespace right after readonly goes too, or the join
+                    // leaves a doubled space (`new  class`).
+                    $skippedWs = false;
+                    for ($m = $i + 1; $m < $j; $m++) {
+                        if ($m === $roIdx) {
+                            continue;
+                        }
+                        $tm = $tokens[$m];
+                        if ($m > $roIdx && !$skippedWs
+                            && is_array($tm) && $tm[0] === T_WHITESPACE) {
+                            $skippedWs = true;
+                            continue;
+                        }
+                        $out .= is_array($tm) ? $tm[1] : $tm;
+                    }
+                    $i = $j; // land on `class`
+                    continue;
                 }
                 $out .= $text;
                 $i++;
@@ -465,6 +529,61 @@ class Transpiler
         return $out;
     }
 
+    /** Next meaningful (non-ws/comment) token index from $j, or null. */
+    private static function nextMeaningful(array $tokens, int $j): ?int
+    {
+        $count = count($tokens);
+        for (; $j < $count; $j++) {
+            $t = $tokens[$j];
+            if (is_array($t) && in_array($t[0], [T_WHITESPACE, T_COMMENT, T_DOC_COMMENT], true)) {
+                continue;
+            }
+            return $j;
+        }
+        return null;
+    }
+
+    /**
+     * Index of the $close char that balances the open already consumed —
+     * i.e. the first $close at relative depth 0, skipping nested $open/$close
+     * pairs. Returns null when unbalanced.
+     */
+    private static function matchForward(array $tokens, int $j, string $open, string $close): ?int
+    {
+        $count = count($tokens);
+        $d = 0;
+        for (; $j < $count; $j++) {
+            $c = is_array($tokens[$j]) ? null : $tokens[$j];
+            if ($c === $open) {
+                $d++;
+            } elseif ($c === $close) {
+                if ($d === 0) {
+                    return $j;
+                }
+                $d--;
+            }
+        }
+        return null;
+    }
+
+    /** Backward counterpart of matchForward. */
+    private static function matchBackward(array $tokens, int $j, string $open, string $close): ?int
+    {
+        $d = 0;
+        for (; $j >= 0; $j--) {
+            $c = is_array($tokens[$j]) ? null : $tokens[$j];
+            if ($c === $close) {
+                $d++;
+            } elseif ($c === $open) {
+                if ($d === 0) {
+                    return $j;
+                }
+                $d--;
+            }
+        }
+        return null;
+    }
+
     /**
      * Find the start index of the expression immediately before `::` at $i —
      * a backward token walk handling `$a[0]`, `Foo::BAR`, `($a . $b)`,
@@ -556,14 +675,16 @@ class Transpiler
                 $raw[] = [$desc, $m[0][1], 'fn'];
             }
         }
-        // ReflectionClassConstant::{hasType,getType} (8.3) are instance calls —
-        // the needle spelling `ReflectionClassConstant::getType` misses the
-        // normal `$rc->getType()`. Flag them when the class is referenced AND
-        // a matching instance call appears (best-effort; receiver types are
-        // unknowable without real type inference).
+        // ReflectionClassConstant::{hasType,getType} (8.3) are instance
+        // calls — `$rc->getType()`. The receiver decides: `$c->getType()` on
+        // a ReflectionParameter is legal on every version, so flag only
+        // receivers PROVABLY holding a ReflectionClassConstant (param type,
+        // `new`, ->getReflectionConstant(s) sources, direct chains).
         if (strpos($hay, 'ReflectionClassConstant') !== false
-            && preg_match('/->\s*(?:hasType|getType)\s*\(/', $hay, $mm, PREG_OFFSET_CAPTURE)) {
-            $raw[] = ['ReflectionClassConstant->hasType/getType (8.3)', $mm[0][1], 'fn'];
+            || strpos($hay, 'getReflectionConstant') !== false) {
+            foreach (self::findRccTypeCalls($hay) as $pos) {
+                $raw[] = ['ReflectionClassConstant->hasType/getType (8.3)', $pos, 'fn'];
+            }
         }
 
         // Token-level static-init analysis only when the cheap strpos gate
@@ -652,6 +773,338 @@ class Transpiler
             $hits[] = $guarded
                 ? "$path: GUARDED $desc — behind a PHP 8.3 guard, unreachable on 8.2"
                 : "$path: UNSHIMMABLE $desc — will fatal if reached on 8.2";
+        }
+        return $hits;
+    }
+
+    /**
+     * Byte offsets of `->getType()`/`->hasType()` calls whose receiver is
+     * provably a ReflectionClassConstant. Scope-aware: param types shadow
+     * outer variables, and evidence inside a nested function never leaks.
+     * Sources counted: `X $v` param type, `$v = new X`, `$v = ->getReflectionConstant()`,
+     * `foreach (->getReflectionConstants() as $v)`, and direct chains like
+     * `->getReflectionConstant('c')->getType()` / `(new X(...))->getType()`.
+     *
+     * @return list<int>
+     */
+    private static function findRccTypeCalls(string $code): array
+    {
+        try {
+            $tokens = token_get_all($code);
+        } catch (\Throwable) {
+            return [];
+        }
+        $count = count($tokens);
+        if ($count === 0) {
+            return [];
+        }
+        $off = [];
+        $p = 0;
+        foreach ($tokens as $t) {
+            $off[] = $p;
+            $p += strlen(is_array($t) ? $t[1] : $t);
+        }
+
+        $names = [T_STRING, T_NAME_QUALIFIED, T_NAME_FULLY_QUALIFIED, T_NAME_RELATIVE];
+        $isRcc = static function ($t) use ($names): bool {
+            if (!is_array($t) || !in_array($t[0], $names, true)) {
+                return false;
+            }
+            $n = ltrim($t[1], '\\');
+            return $n === 'ReflectionClassConstant' || str_ends_with($n, '\\ReflectionClassConstant');
+        };
+        $wsIds = [T_WHITESPACE, T_COMMENT, T_DOC_COMMENT];
+        $skip = static function (int $j, int $dir) use ($tokens, $count, $wsIds): ?int {
+            for ($j += $dir; $j >= 0 && $j < $count; $j += $dir) {
+                if (is_array($tokens[$j]) && in_array($tokens[$j][0], $wsIds, true)) {
+                    continue;
+                }
+                return $j;
+            }
+            return null;
+        };
+
+        // ---- scopes: every function/fn body + one global scope ------------
+        $scopes = [['start' => 0, 'end' => $count - 1, 'params' => [], 'extra' => []]];
+        for ($i = 0; $i < $count; $i++) {
+            $t = $tokens[$i];
+            if (!is_array($t) || ($t[0] !== T_FUNCTION && $t[0] !== T_FN)) {
+                continue;
+            }
+            $isFn = $t[0] === T_FN;
+            $j = $skip($i, 1);
+            if ($j === null) {
+                break;
+            }
+            if ($tokens[$j] === '&') {
+                $j = $skip($j, 1);
+            }
+            if (!$isFn && $j !== null && is_array($tokens[$j]) && $tokens[$j][0] === T_STRING) {
+                $j = $skip($j, 1); // function name
+            }
+            if ($j === null || $tokens[$j] !== '(') {
+                continue;
+            }
+            $pEnd = self::matchForward($tokens, $j + 1, '(', ')');
+            if ($pEnd === null) {
+                break;
+            }
+            // Param var types: an RCC name between the , / ( boundary and the
+            // variable marks it (union `A|X`, nullable `?X`, promoted all ok).
+            $params = [];
+            for ($k = $j + 1; $k < $pEnd; $k++) {
+                $tk = $tokens[$k];
+                if (!is_array($tk) || $tk[0] !== T_VARIABLE) {
+                    continue;
+                }
+                $rcc = false;
+                $typed = false;
+                for ($q = $k - 1; $q > $j; $q--) {
+                    $tq = $tokens[$q];
+                    if (!is_array($tq)) {
+                        if ($tq === ',' || $tq === '=') {
+                            break;
+                        }
+                        continue;
+                    }
+                    if (in_array($tq[0], $wsIds, true)) {
+                        continue;
+                    }
+                    if ($isRcc($tq)) {
+                        $rcc = true;
+                        $typed = true;
+                        break;
+                    }
+                    if (in_array($tq[0], $names, true)) {
+                        $typed = true;
+                    }
+                }
+                if ($typed) {
+                    $params[$tk[1]] = $rcc;
+                }
+            }
+            // Body range
+            $b = $skip($pEnd, 1);
+            if ($b === null) {
+                break;
+            }
+            if ($isFn) {
+                while ($b !== null && !(is_array($tokens[$b]) && $tokens[$b][0] === T_DOUBLE_ARROW)) {
+                    $b = $skip($b, 1);
+                }
+                if ($b === null) {
+                    continue;
+                }
+                $bodyS = $b;
+                $d = 0;
+                $bodyE = $count - 1;
+                for ($q = $b + 1; $q < $count; $q++) {
+                    $c = is_array($tokens[$q]) ? null : $tokens[$q];
+                    if ($c === '(' || $c === '[' || $c === '{') {
+                        $d++;
+                    } elseif ($c === ')' || $c === ']' || $c === '}') {
+                        if ($d === 0) {
+                            $bodyE = $q - 1;
+                            break;
+                        }
+                        $d--;
+                    } elseif (($c === ',' || $c === ';') && $d === 0) {
+                        $bodyE = $q - 1;
+                        break;
+                    }
+                }
+            } else {
+                while ($b !== null && $tokens[$b] !== '{' && $tokens[$b] !== ';') {
+                    $b = $skip($b, 1);
+                }
+                if ($b === null || $tokens[$b] !== '{') {
+                    continue; // abstract / interface method — no body
+                }
+                $bodyS = $b;
+                $bodyE = self::matchForward($tokens, $b + 1, '{', '}') ?? ($count - 1);
+            }
+            $scopes[] = ['start' => $bodyS, 'end' => $bodyE, 'params' => $params, 'extra' => []];
+        }
+
+        // ---- evidence inside each scope (nested scopes excluded) ----------
+        $inRanges = static function (int $idx, array $ranges, int $except): bool {
+            foreach ($ranges as $ri => $r) {
+                if ($ri === $except) {
+                    continue;
+                }
+                if ($idx >= $r[0] && $idx <= $r[1]) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        $collect = static function (int $a, int $b, array $exclude) use (
+            $tokens, $skip, $isRcc, $inRanges
+        ): array {
+            $vars = [];
+            for ($k = $a; $k <= $b; $k++) {
+                if ($inRanges($k, $exclude, -1)) {
+                    continue;
+                }
+                $tk = $tokens[$k];
+                if (is_array($tk) && $tk[0] === T_VARIABLE) {
+                    $n = $skip($k, 1);
+                    if ($n === null || $tokens[$n] !== '=') {
+                        continue;
+                    }
+                    $v = $skip($n, 1);
+                    if ($v === null) {
+                        continue;
+                    }
+                    $vt = $tokens[$v];
+                    if (is_array($vt) && $vt[0] === T_NEW) {
+                        $m = $skip($v, 1);
+                        if ($m !== null && $isRcc($tokens[$m])) {
+                            $vars[$tk[1]] = true;
+                        }
+                    } else {
+                        for ($q = $v; $q <= $b; $q++) {
+                            $tq = $tokens[$q];
+                            if (!is_array($tq) && $tq === ';') {
+                                break;
+                            }
+                            if (is_array($tq) && $tq[0] === T_STRING && $tq[1] === 'getReflectionConstant') {
+                                $vars[$tk[1]] = true;
+                                break;
+                            }
+                        }
+                    }
+                    continue;
+                }
+                if (is_array($tk) && $tk[0] === T_FOREACH) {
+                    $o = $skip($k, 1);
+                    if ($o === null || $tokens[$o] !== '(') {
+                        continue;
+                    }
+                    $fe = self::matchForward($tokens, $o + 1, '(', ')');
+                    if ($fe === null) {
+                        continue;
+                    }
+                    $has = false;
+                    $asI = null;
+                    $d = 0;
+                    for ($q = $o + 1; $q < $fe; $q++) {
+                        $tq = $tokens[$q];
+                        $c = is_array($tq) ? null : $tq;
+                        if ($c === '(') {
+                            $d++;
+                        } elseif ($c === ')') {
+                            $d--;
+                        } elseif (is_array($tq) && $tq[0] === T_AS && $d === 0) {
+                            $asI = $q;
+                        }
+                        if (is_array($tq) && $tq[0] === T_STRING && $tq[1] === 'getReflectionConstants') {
+                            $has = true;
+                        }
+                    }
+                    if ($has && $asI !== null) {
+                        for ($q = $fe - 1; $q > $asI; $q--) {
+                            if (is_array($tokens[$q]) && $tokens[$q][0] === T_VARIABLE) {
+                                $vars[$tokens[$q][1]] = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            return $vars;
+        };
+        $ranges = array_map(static fn($s) => [$s['start'], $s['end']], $scopes);
+        foreach ($scopes as $si => &$s) {
+            $my = array_values(array_filter($ranges, static fn($r, $ri) =>
+                $ri !== $si && $ri !== 0 && $r[0] > $s['start'] && $r[1] <= $s['end'], ARRAY_FILTER_USE_BOTH));
+            // global scope excludes every function body
+            $excl = $si === 0
+                ? array_values(array_filter($ranges, static fn($r, $ri) => $ri !== 0, ARRAY_FILTER_USE_BOTH))
+                : $my;
+            $s['extra'] = $collect($s['start'], $s['end'], $excl);
+        }
+        unset($s);
+
+        // ---- hit walk ------------------------------------------------------
+        $hits = [];
+        for ($i = 0; $i < $count; $i++) {
+            $t = $tokens[$i];
+            if (!is_array($t) || ($t[0] !== T_OBJECT_OPERATOR && $t[0] !== T_NULLSAFE_OBJECT_OPERATOR)) {
+                continue;
+            }
+            $m = $skip($i, 1);
+            if ($m === null || !is_array($tokens[$m]) || $tokens[$m][0] !== T_STRING
+                || !in_array($tokens[$m][1], ['getType', 'hasType'], true)) {
+                continue;
+            }
+            $a = $skip($m, 1);
+            if ($a === null || $tokens[$a] !== '(') {
+                continue;
+            }
+            $r = $skip($i, -1);
+            if ($r === null) {
+                continue;
+            }
+            $rt = $tokens[$r];
+            $hit = false;
+            if (is_array($rt) && $rt[0] === T_VARIABLE) {
+                // innermost scope first; param typing shadows outer vars
+                $inside = [];
+                foreach ($scopes as $s) {
+                    if ($i >= $s['start'] && $i <= $s['end']) {
+                        $inside[] = $s;
+                    }
+                }
+                usort($inside, static fn($x, $y) => ($x['end'] - $x['start']) <=> ($y['end'] - $y['start']));
+                foreach ($inside as $s) {
+                    if (array_key_exists($rt[1], $s['params'])) {
+                        $hit = $s['params'][$rt[1]];
+                        break;
+                    }
+                    if (isset($s['extra'][$rt[1]])) {
+                        $hit = true;
+                        break;
+                    }
+                }
+            } elseif ($rt === ')') {
+                $o = self::matchBackward($tokens, $r - 1, '(', ')');
+                if ($o !== null) {
+                    $before = $skip($o, -1);
+                    if ($before !== null && is_array($tokens[$before])
+                        && $tokens[$before][0] === T_STRING
+                        && $tokens[$before][1] === 'getReflectionConstant') {
+                        $hit = true;
+                    } else {
+                        for ($q = $o + 1; $q < $r; $q++) {
+                            if (is_array($tokens[$q]) && $tokens[$q][0] === T_NEW) {
+                                $n = $skip($q, 1);
+                                if ($n !== null && $isRcc($tokens[$n])) {
+                                    $hit = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            } elseif ($rt === ']') {
+                $ob = self::matchBackward($tokens, $r - 1, '[', ']');
+                if ($ob !== null) {
+                    $b2 = $skip($ob, -1);
+                    if ($b2 !== null && $tokens[$b2] === ')') {
+                        $o = self::matchBackward($tokens, $b2 - 1, '(', ')');
+                        $bf = $o === null ? null : $skip($o, -1);
+                        if ($bf !== null && is_array($tokens[$bf])
+                            && $tokens[$bf][0] === T_STRING
+                            && $tokens[$bf][1] === 'getReflectionConstants') {
+                            $hit = true;
+                        }
+                    }
+                }
+            }
+            if ($hit) {
+                $hits[] = $off[$i];
+            }
         }
         return $hits;
     }
@@ -849,8 +1302,15 @@ class Transpiler
                 $v = (int)$bTok[1];
                 // True/false must hold for the whole 8.2.x range — check the
                 // extreme bound that is most likely to flip the verdict.
-                $lo = eval("return 80200 $op $v;");
-                $hi = eval("return 80299 $op $v;");
+                $cmp = static fn(int $a, int $b): bool => match ($op) {
+                    '<' => $a < $b, '<=' => $a <= $b,
+                    '>' => $a > $b, '>=' => $a >= $b,
+                    '==', '===' => $a === $b,
+                    '!=', '!==' => $a !== $b,
+                    default => false,
+                };
+                $lo = $cmp(80200, $v);
+                $hi = $cmp(80299, $v);
                 if ($lo === $hi) {
                     return [$lo ? 'true82' : 'false82', null];
                 }

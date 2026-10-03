@@ -2,7 +2,7 @@
     "name": "sogl/php-82-shim",
     "type": "grav-plugin",
     "description": "Run a Grav 2 site on PHP 8.2 hosts",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "keywords": [
         "grav",
         "plugin",
@@ -20,7 +20,7 @@
         }
     ],
     "require": {
-        "php": ">=8.2 <8.4"
+        "php": ">=8.2"
     },
     "autoload": {
         "psr-4": {

@@ -7,9 +7,4 @@ $baseDir = dirname($vendorDir);
 
 return array(
     'Composer\\InstalledVersions' => $vendorDir . '/composer/InstalledVersions.php',
-    'Grav\\Plugin\\Php82Shim\\Api\\ShimApiController' => $baseDir . '/classes/Php82Shim/Api/ShimApiController.php',
-    'Grav\\Plugin\\Php82Shim\\Lock' => $baseDir . '/classes/Php82Shim/Lock.php',
-    'Grav\\Plugin\\Php82Shim\\PatchManager' => $baseDir . '/classes/Php82Shim/PatchManager.php',
-    'Grav\\Plugin\\Php82Shim\\ShimLog' => $baseDir . '/classes/Php82Shim/ShimLog.php',
-    'Grav\\Plugin\\Php82Shim\\Transpiler' => $baseDir . '/classes/Php82Shim/Transpiler.php',
 );

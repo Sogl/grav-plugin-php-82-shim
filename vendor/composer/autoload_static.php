@@ -22,11 +22,6 @@ class ComposerStaticInit1dda8d82ea6c6125bef5d17dab79a358
 
     public static $classMap = array (
         'Composer\\InstalledVersions' => __DIR__ . '/..' . '/composer/InstalledVersions.php',
-        'Grav\\Plugin\\Php82Shim\\Api\\ShimApiController' => __DIR__ . '/../..' . '/classes/Php82Shim/Api/ShimApiController.php',
-        'Grav\\Plugin\\Php82Shim\\Lock' => __DIR__ . '/../..' . '/classes/Php82Shim/Lock.php',
-        'Grav\\Plugin\\Php82Shim\\PatchManager' => __DIR__ . '/../..' . '/classes/Php82Shim/PatchManager.php',
-        'Grav\\Plugin\\Php82Shim\\ShimLog' => __DIR__ . '/../..' . '/classes/Php82Shim/ShimLog.php',
-        'Grav\\Plugin\\Php82Shim\\Transpiler' => __DIR__ . '/../..' . '/classes/Php82Shim/Transpiler.php',
     );
 
     public static function getInitializer(ClassLoader $loader)

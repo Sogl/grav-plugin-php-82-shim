@@ -6,8 +6,11 @@
 
 $base = dirname(__DIR__) . '/classes/Php82Shim';
 require_once $base . '/ShimLog.php';
+require_once $base . '/Lock.php';
 require_once $base . '/Transpiler.php';
+require_once $base . '/PatchManager.php';
 
+use Grav\Plugin\Php82Shim\PatchManager;
 use Grav\Plugin\Php82Shim\Transpiler;
 
 $cases = [
@@ -37,7 +40,7 @@ $cases = [
     ],
     'new readonly + comment demoted' => [
         '<?php $a = new readonly /* why */ class {};',
-        '<?php $a = new class {};',
+        '<?php $a = new /* why */ class {};', // comment preserved, readonly dropped
     ],
 
     // --- dynamic class constant fetch ------------------------------------------
@@ -217,6 +220,104 @@ $cases = [
         'same',
         'flag' => 'GUARDED',
     ],
+
+    // --- ReflectionClassConstant receiver analysis (Grav maintainer report) ----
+    // Stock vendor/symfony/var-dumper/Caster/ReflectionCaster.php shape:
+    // the file mentions ReflectionClassConstant AND calls $c->getType(), but
+    // the receiver is ReflectionParameter — legal on every PHP version.
+    'ReflectionCaster false positive' => [
+        "<?php function castClassConstant(\\ReflectionClassConstant \$c, array \$a) { return \$a; }\n"
+        . "function castParameter(\\ReflectionParameter \$c, array \$a) { return \$c->getType(); }\n"
+        . "function f(\$param) { return \$param->getType(); }",
+        'same',
+    ],
+    // ...and the REAL 8.3 call must still be caught
+    'RCC param getType flagged' => [
+        '<?php function f(\ReflectionClassConstant $c) { return $c->getType(); }',
+        'same',
+        'flag' => 'UNSHIMMABLE',
+    ],
+    'RCC param hasType flagged' => [
+        '<?php function f(\ReflectionClassConstant $c) { return $c->hasType(); }',
+        'same',
+        'flag' => 'UNSHIMMABLE',
+    ],
+    'RCC unqualified param flagged' => [
+        '<?php use Foo\Bar; function f(ReflectionClassConstant $c) { return $c->getType(); }',
+        'same',
+        'flag' => 'UNSHIMMABLE',
+    ],
+    'RCC union param flagged' => [
+        '<?php function f(\ReflectionParameter|\ReflectionClassConstant $c) { return $c->getType(); }',
+        'same',
+        'flag' => 'UNSHIMMABLE',
+    ],
+    'getReflectionConstant chain flagged' => [
+        "<?php function f(\$r) { return \$r->getReflectionConstant('C')->getType(); }",
+        'same',
+        'flag' => 'UNSHIMMABLE',
+    ],
+    'getReflectionConstants index flagged' => [
+        '<?php function f($r) { return $r->getReflectionConstants()[0]->hasType(); }',
+        'same',
+        'flag' => 'UNSHIMMABLE',
+    ],
+    'new RCC receiver flagged' => [
+        '<?php function f($x) { $c = new \ReflectionClassConstant($x, \'K\'); return $c->getType(); }',
+        'same',
+        'flag' => 'UNSHIMMABLE',
+    ],
+    'foreach RCC receiver flagged' => [
+        '<?php function f($r) { foreach ($r->getReflectionConstants() as $c) { $c->getType(); } }',
+        'same',
+        'flag' => 'UNSHIMMABLE',
+    ],
+    'getType on untyped var NOT flagged' => [
+        '<?php function f(\ReflectionClassConstant $x, $c) { return $c->getType(); }',
+        'same',
+    ],
+    'RCC mention in string NOT flagged' => [
+        '<?php function f($c) { $s = "ReflectionClassConstant"; return $c->getType(); }',
+        'same',
+    ],
+
+    // --- typed const context-stack (interpolation / anon-class args) ----------
+    'typed const after "{$x}" interp' => [
+        '<?php class A { function f() { $s = "{$x}"; } const int N = 1; }',
+        '<?php class A { function f() { $s = "{$x}"; } const N = 1; }',
+    ],
+    'typed const after "${x}" interp' => [
+        '<?php class A { function f() { $s = "${x}"; } const int N = 1; }',
+        '<?php class A { function f() { $s = "${x}"; } const N = 1; }',
+    ],
+    'typed const after heredoc interp' => [
+        "<?php class A { function f() { \$s = <<<EOT\nhi {\$x} bye\nEOT; } const int N = 1; }",
+        "<?php class A { function f() { \$s = <<<EOT\nhi {\$x} bye\nEOT; } const N = 1; }",
+    ],
+    'typed const after "{$x->y}" interp' => [
+        '<?php class A { function f() { $s = "{$x->y}"; } const int N = 1; }',
+        '<?php class A { function f() { $s = "{$x->y}"; } const N = 1; }',
+    ],
+    'new class(fn) typed const stripped' => [
+        '<?php $a = new class(fn() => 1) { const int N = 1; };',
+        '<?php $a = new class(fn() => 1) { const N = 1; };',
+    ],
+    'new class(fn) const inside fn untouched' => [
+        '<?php $a = new class(function () { const X = 1; }) { const int N = 1; };',
+        '<?php $a = new class(function () { const X = 1; }) { const N = 1; };',
+    ],
+    'new class(attr arg) typed const stripped' => [
+        '<?php $a = new class(function ($x = #[A] 1) {}) { const int N = 1; };',
+        '<?php $a = new class(function ($x = #[A] 1) {}) { const N = 1; };',
+    ],
+    'new #[Attr] readonly class demoted + stripped' => [
+        '<?php $a = new #[Attr] readonly class { const int N = 1; };',
+        '<?php $a = new #[Attr] class { const N = 1; };',
+    ],
+    'new readonly #[Attr] class demoted' => [
+        '<?php $a = new readonly #[Attr] class {};',
+        '<?php $a = new #[Attr] class {};',
+    ],
 ];
 
 $pass = $fail = 0;
@@ -346,6 +447,137 @@ $check('plugin vendor platform_check stubbed', function () {
 // class stubs exist for catch/instanceof parity
 $check('#[\\Override] stub',       fn() => class_exists(\Override::class) || class_exists('Override'));
 $check('Date exception stubs',     fn() => class_exists('DateRangeError') && class_exists('DateInvalidOperationException'));
+
+// ---- PatchManager runtime/arm gates (Grav maintainer report) ---------------
+
+// On a real PHP 8.2 test run the private gate must say yes.
+$check('isTarget82 true on this runtime', function () {
+    $m = new ReflectionMethod(PatchManager::class, 'isTarget82');
+    $m->setAccessible(true);
+    return $m->invoke(null) === (PHP_VERSION_ID >= 80200 && PHP_VERSION_ID < 80300);
+});
+
+// A tree whose anchors all fail must NOT get .user.ini armed — bootstrap
+// fails closed and a later web request (ensure) applies the same gate.
+$check('failed heal does not arm .user.ini', function () {
+    $tmp = sys_get_temp_dir() . '/php82shim-arm-' . getmypid();
+    @mkdir($tmp . '/system', 0777, true);
+    file_put_contents($tmp . '/index.php', "<?php // no anchors\n");
+    file_put_contents($tmp . '/system/defines.php', "<?php // no anchors\n");
+    $r = PatchManager::bootstrap($tmp);
+    $armed = is_file($tmp . '/.user.ini');
+    @unlink($tmp . '/index.php');
+    @unlink($tmp . '/system/defines.php');
+    @rmdir($tmp . '/system');
+    @rmdir($tmp);
+    return $r['failed'] !== [] && !$armed;
+});
+
+// And the positive path: every anchor present -> healed AND armed.
+$check('clean heal arms .user.ini', function () {
+    $tmp = sys_get_temp_dir() . '/php82shim-arm-ok-' . getmypid();
+    @mkdir($tmp . '/system/src/Grav/Common/GPM/Remote', 0777, true);
+    @mkdir($tmp . '/system/src/Grav/Installer', 0777, true);
+    @mkdir($tmp . '/bin', 0777, true);
+    @mkdir($tmp . '/user', 0777, true);
+    $files = [
+        'index.php' => "<?php \\define('GRAV_PHP_MIN', '8.3.0');\n",
+        'system/defines.php' => "<?php define(\"GRAV_PHP_MIN\", \"8.3.0\");\n",
+        'bin/grav' => "#!/usr/bin/env php\n<?php if (PHP_VERSION_ID < 80300) { echo 'min'; }\n",
+        'system/src/Grav/Common/GPM/Remote/AbstractPackageCollection.php' => "<?php \$u = '&php=' . PHP_VERSION;\n",
+        'system/src/Grav/Common/GPM/Remote/GravCore.php' => "<?php \$u = '&php=' . PHP_VERSION;\n",
+        'system/src/Grav/Common/GPM/Upgrader.php' => "<?php version_compare(PHP_VERSION, \$this->minPHPVersion(), '<');\n",
+        'system/src/Grav/Common/GPM/GPM.php' => "<?php version_compare(\$testVersion, PHP_VERSION);\n",
+        'system/src/Grav/Installer/Install.php' => "<?php checkVersion(\$results, 'php', 'php', \$this->requires['php'], PHP_VERSION);\n",
+        'system/src/Grav/Common/GPM/Installer.php' =>
+            "<?php\n            self::\$error = self::OK;\n\n            return \$destination . '/' . \$package_folder_name;\n"
+            . "        if (!file_exists(\$extracted)) {\n            self::\$error = self::INVALID_SOURCE;\n            return false;\n        }\n",
+        'composer.json' => "{\"require\": {\"php\": \"^8.3\"}}\n",
+    ];
+    foreach ($files as $f => $c) {
+        @mkdir(dirname($tmp . '/' . $f), 0777, true);
+        file_put_contents($tmp . '/' . $f, $c);
+    }
+    $r = PatchManager::bootstrap($tmp);
+    $armed = is_file($tmp . '/.user.ini');
+    $stub = is_file($tmp . '/user/php82shim-early.php');
+    // cleanup
+    $it = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator($tmp, FilesystemIterator::SKIP_DOTS),
+        RecursiveIteratorIterator::CHILD_FIRST
+    );
+    foreach ($it as $f) {
+        $f->isDir() ? @rmdir($f->getPathname()) : @unlink($f->getPathname());
+    }
+    @rmdir($tmp);
+    return $r['failed'] === [] && $armed && $stub;
+});
+
+// Cross-runtime refusal: when a non-8.2 PHP binary exists on this machine,
+// bootstrap MUST exit 1 before touching anything. Auto-discovers binaries;
+// override with PHP82SHIM_ALT_PHP. Skips quietly when only 8.2 is present.
+$check('non-8.2 runtime refusal (subprocess)', function () {
+    $candidates = [];
+    if ($env = getenv('PHP82SHIM_ALT_PHP')) {
+        $candidates[] = $env;
+    }
+    foreach (['/usr/local/opt/php@*/bin/php', '/opt/homebrew/opt/php@*/bin/php'] as $g) {
+        foreach (glob($g) ?: [] as $p) {
+            $candidates[] = $p;
+        }
+    }
+    $alt = null;
+    foreach ($candidates as $c) {
+        if (!is_executable($c)) {
+            continue;
+        }
+        $v = (int)trim((string)@shell_exec(escapeshellarg($c) . ' -r "echo PHP_VERSION_ID;" 2>/dev/null'));
+        if ($v > 0 && ($v < 80200 || $v >= 80300)) {
+            $alt = $c;
+            break;
+        }
+    }
+    if ($alt === null) {
+        return true; // nothing to verify against
+    }
+    $boot = dirname(__DIR__) . '/bin/bootstrap.php';
+    $out = [];
+    exec(escapeshellarg($alt) . ' ' . escapeshellarg($boot) . ' 2>&1', $out, $code);
+    return $code === 1 && str_contains(implode("\n", $out), 'refusing to run');
+});
+
+// early.php e2e: the prepend runs before index.php — emulate via
+// `php -d auto_prepend_file=` on a fixture root holding a plugin copy.
+// Asserts heartbeat is written and the request completes.
+$check('early.php prepend heartbeat (subprocess)', function () {
+    $tmp = sys_get_temp_dir() . '/php82shim-early-' . getmypid();
+    $plugSrc = dirname(__DIR__);
+    $plug = $tmp . '/user/plugins/php-82-shim';
+    @mkdir($plug . '/classes/Php82Shim', 0777, true);
+    foreach (['ShimLog', 'Lock', 'Transpiler', 'PatchManager'] as $cls) {
+        copy($plugSrc . '/classes/Php82Shim/' . $cls . '.php', $plug . '/classes/Php82Shim/' . $cls . '.php');
+    }
+    copy($plugSrc . '/classes/Php82Shim/polyfill.php', $plug . '/classes/Php82Shim/polyfill.php');
+    copy($plugSrc . '/early.php', $plug . '/early.php');
+    // `php -r` skips auto_prepend_file — a real request file is required.
+    file_put_contents($tmp . '/req.php', "<?php echo 'REQ_OK';\n");
+    $cmd = escapeshellarg(PHP_BINARY)
+        . ' -d auto_prepend_file=' . escapeshellarg($plug . '/early.php')
+        . ' ' . escapeshellarg($tmp . '/req.php') . ' 2>&1';
+    $out = [];
+    exec($cmd, $out, $code);
+    $hb = $tmp . '/user/data/php82shim/early-heartbeat';
+    $beat = is_file($hb);
+    $it = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator($tmp, FilesystemIterator::SKIP_DOTS),
+        RecursiveIteratorIterator::CHILD_FIRST
+    );
+    foreach ($it as $f) {
+        $f->isDir() ? @rmdir($f->getPathname()) : @unlink($f->getPathname());
+    }
+    @rmdir($tmp);
+    return $code === 0 && in_array('REQ_OK', $out, true) && $beat;
+});
 
 echo "\n$pass passed, $fail failed\n";
 exit($fail ? 1 : 0);

@@ -16,6 +16,16 @@ class PatchManager
     private const FAKE_PHP = '8.3.99';
     private const STATE = 'user://data/php82shim/state.json';
 
+    /**
+     * Real PHP 8.2 runtime? Every mutating entry point must refuse to run
+     * anywhere else — on native 8.3+ a patch would fake the reported PHP and
+     * mangle a runtime that needs no shim, and below 8.2 nothing here works.
+     */
+    private static function isTarget82(): bool
+    {
+        return PHP_VERSION_ID >= 80200 && PHP_VERSION_ID < 80300;
+    }
+
     /** @return array<string, list<array{search:string, replace:string, applied:string}>> */
     private static function rules(): array
     {
@@ -154,9 +164,15 @@ class PatchManager
      */
     public static function bootstrap(string $root): array
     {
+        if (!self::isTarget82()) {
+            ShimLog::add('bootstrap', 'refusing — runtime is PHP ' . PHP_VERSION . ', not 8.2 (no patching, no prepend)');
+            return ['patched' => [], 'failed' => []];
+        }
         $root = rtrim($root, '/');
         $result = self::heal($root, 'bootstrap');
-        self::writeUserIni($root);
+        if ($result['failed'] === []) {
+            self::writeUserIni($root);
+        }
         return $result;
     }
 
@@ -168,9 +184,17 @@ class PatchManager
      */
     public static function ensure(Grav $grav): array
     {
+        if (!self::isTarget82()) {
+            return ['patched' => [], 'failed' => []];
+        }
         $root = rtrim(GRAV_ROOT, '/');
         $result = self::heal($root, 'ensure');
-        self::writeUserIni($root);
+        // Same gate bin/bootstrap.php applies: when the tree could not be
+        // fully patched, the prepend must NOT be armed — an armed shim on a
+        // half-patched core is exactly the state bootstrap refuses to leave.
+        if ($result['failed'] === []) {
+            self::writeUserIni($root);
+        }
         self::saveState($grav, $result['failed']);
 
         return $result;
@@ -185,6 +209,9 @@ class PatchManager
      */
     public static function patchTree(string $root): array
     {
+        if (!self::isTarget82()) {
+            return ['patched' => [], 'failed' => []];
+        }
         $root = rtrim($root, '/');
         if (!is_file($root . '/index.php') || !is_file($root . '/system/defines.php')) {
             return ['patched' => [], 'failed' => []];
@@ -227,6 +254,11 @@ class PatchManager
 
     private static function healInner(string $root, string $src): array
     {
+        // Innermost mutator — the runtime gate lives here so EVERY path in
+        // (ensure, bootstrap, payload patching, early prepend) refuses off 8.2.
+        if (!self::isTarget82()) {
+            return ['patched' => [], 'failed' => []];
+        }
         // A Grav core self-update is in flight — upstream Installer drops a
         // `.upgrading` marker before swapping live files. Writing now could
         // atomically rename stale bytes back over the new release.
@@ -378,6 +410,7 @@ PHP;
         if (!is_file($stub) || (string)@file_get_contents($stub) !== $stubCode) {
             // Fail-closed: if the stub can't be written, arming .user.ini with
             // a dangling auto_prepend_file would fatal EVERY request.
+            @mkdir(dirname($stub), 0775, true);
             if (!self::writeAtomic($stub, $stubCode)) {
                 ShimLog::add('patch-fail', 'user-ini: cannot write prepend stub ' . $stub);
                 return;

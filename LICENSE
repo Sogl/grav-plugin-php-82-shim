@@ -1,6 +1,6 @@
 MIT License
 
-Copyright (c) 2026 Artyom Palagin
+Copyright (c) 2026 Artyom Mezin
 
 Portions of classes/Php82Shim/polyfill.php are ported verbatim from
 symfony/polyfill-php83:

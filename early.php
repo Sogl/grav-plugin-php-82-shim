@@ -30,6 +30,9 @@ require_once __DIR__ . '/classes/Php82Shim/polyfill.php';
 $php82hb = \Grav\Plugin\Php82Shim\ShimLog::dataDir() . '/early-heartbeat';
 if (!$php82native
     && (!is_file($php82hb) || time() - (int)@file_get_contents($php82hb) > 60)) {
+    // First-ever prepend: the data dir may not exist yet (Lock creates it
+    // only later, inside the heal section) — the heartbeat must still land.
+    @mkdir(dirname($php82hb), 0775, true);
     @file_put_contents($php82hb, (string)time(), LOCK_EX);
 }
 
@@ -37,6 +40,7 @@ if (!$php82native
 // on every request, and is dropped again if the runtime returns to 8.2.
 $php82sd = \Grav\Plugin\Php82Shim\ShimLog::dataDir() . '/native-83.flag';
 if ($php82native && !is_file($php82sd)) {
+    @mkdir(dirname($php82sd), 0775, true);
     @file_put_contents($php82sd, (string)time(), LOCK_EX);
     \Grav\Plugin\Php82Shim\ShimLog::add(
         'bootstrap',

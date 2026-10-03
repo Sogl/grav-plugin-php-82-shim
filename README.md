@@ -4,6 +4,13 @@ English | [Русский](README_RU.md)
 
 Runs a Grav 2 site on PHP 8.2 shared hosts that cannot offer PHP 8.3. The plugin relaxes the version gates in Grav core and transpiles PHP 8.3-only syntax in installed packages down to 8.2, with a fail-closed update path and a visible activity log.
 
+> **⚠️ Unofficial compatibility layer.** This plugin is not affiliated with
+> or endorsed by the Grav team — it rewrites core files to run a site on a
+> PHP version upstream does not support. If something breaks while it is
+> active, do **not** report it to Grav or to other plugin/theme authors:
+> their code targets PHP 8.3+, and the shim is not their responsibility.
+> File issues on this plugin's tracker instead.
+
 ![PHP 8.2 Shim — activity log in Grav Admin](assets/interface.jpg)
 
 ## What it does
@@ -36,6 +43,11 @@ Successfully tested with Grav **2.2.x** on PHP **8.2.30**.
 ## Installation
 
 This plugin **rewrites Grav core files in place** — back up the site first, or try it on a staging copy.
+
+> **Important:** this is **not a one-click install** — wherever the plugin
+> files come from (GPM or a manual copy), you must run the bootstrap by hand
+> on the PHP 8.2 host (step 2). The plugin does nothing until core is patched
+> and the prepend is armed.
 
 1. Put the plugin into `user/plugins/php-82-shim`.
 2. From the Grav root, run the bootstrap once:
