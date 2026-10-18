@@ -1,3 +1,10 @@
+# v1.1.0
+##  2026-10-14
+
+1. [](#improved)
+    * `Installer::unZip()` interception is now layout-agnostic: detects the extracted package root via `$package_folder_name` (Grav 2.0.x) or `$roots`/`$packageRoots` (Grav 2.2.x), with fallback to `$destination` — covers both archive formats without separate rules
+    * Verified end-to-end: Grav 2.0.3 → 2.0.27 → 2.2.10 self-upgrades and 10 plugin updates (Admin2 2.1.36, Form 9.1.35, Login 3.10.1, …) installed through the shim on PHP 8.2
+
 # v1.0.1
 ##  2026-10-03
 
